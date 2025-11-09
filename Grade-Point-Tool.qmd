@@ -10,9 +10,11 @@ editor: visual
 
 ```{r}
 # ============================
-# Packages (install once):
-# install.packages(c("readxl","openxlsx","dplyr","janitor","readr","ggplot2","tidyr"))
+# GradePointTool — full script
 # ============================
+# Install once:
+# install.packages(c("readxl","openxlsx","dplyr","janitor","readr","ggplot2","tidyr","stringr"))
+
 library(readxl)
 library(openxlsx)
 library(dplyr)
@@ -20,6 +22,8 @@ library(janitor)
 library(readr)
 library(ggplot2)
 library(tidyr)
+library(stringr)
+library(tools)
 
 # ----------------------------
 # Helpers
@@ -46,7 +50,7 @@ grade_broad <- function(grade_fine) {
 }
 to_num <- function(x) suppressWarnings(readr::parse_number(as.character(x)))
 
-# Excel-safe, case-insensitive unique colnames
+# Make column names Excel safe and unique even case-insensitively
 fix_names_excel <- function(df) {
   nm <- names(df)
   nm[is.na(nm) | trimws(nm) == ""] <- "unnamed"
@@ -59,13 +63,28 @@ fix_names_excel <- function(df) {
   names(df) <- nm
   df
 }
-# Drop raw columns that the standardized ones replace (avoid header clashes)
+
+# Drop raw columns that standardized ones replace (avoid header clashes)
 dedupe_source_cols <- function(df, name_col, matric_col, total_col, prac_col, ca_col, exam_col) {
   drop_cols <- c(name_col, matric_col, total_col, prac_col, ca_col, exam_col)
   dplyr::select(df, -dplyr::any_of(drop_cols))
 }
 
-# Plots (viridis colours)
+# Detect a component column like "prac_50" or "prac_20" and its max value
+find_component <- function(df, prefix) {
+  cand <- names(df)[grepl(paste0("^", prefix, "_\\d+$"), names(df))]
+  if (length(cand)) {
+    mx  <- as.integer(stringr::str_match(cand, "_(\\d+)$")[,2])
+    i   <- which.max(mx)
+    list(col = cand[i], max = mx[i])
+  } else if (prefix %in% names(df)) {
+    list(col = prefix, max = NA_integer_)
+  } else {
+    list(col = NA_character_, max = NA_integer_)
+  }
+}
+
+# Plots (viridis palettes)
 plot_grade_bars <- function(data, fine = TRUE) {
   if (fine) {
     data <- data %>% mutate(GradeFine = factor(Grade, levels = c("A+","A","B+","B","C+","C","D","E","F")))
@@ -93,7 +112,7 @@ plot_score_histogram <- function(data, binwidth = 5) {
 }
 
 # ----------------------------
-# Main processor
+# Main processor (single course file)
 # ----------------------------
 process_exam_sheet <- function(in_path,
                                out_path = sub("(\\.[^.]+)$", "_with_grades.xlsx", in_path),
@@ -102,46 +121,54 @@ process_exam_sheet <- function(in_path,
                                save_plots = TRUE,
                                plot_prefix = sub("(\\.[^.]+)$", "", out_path),
                                write_excel_tables = TRUE) {
-  # Read + normalize
+  # Read and normalize
   raw <- read_excel(in_path, sheet = sheet)
-  df  <- raw %>% clean_names()  # e.g., "TOTAL (100)" -> total_100
+  df  <- raw %>% clean_names()  # e.g., "PRAC (20)" -> prac_20; "TOTAL (100)" -> total_100
 
-  # Detect columns
+  # Detect ID columns
   name_col   <- intersect(names(df), c("name","student_name"))[1]
   matric_col <- intersect(names(df), c("matric_no","reg_no","matric"))[1]
-  prac_col   <- intersect(names(df), c("prac_50","practical_50","prac"))[1]
-  ca_col     <- intersect(names(df), c("ca_10","continuous_assessment_10","ca"))[1]
-  exam_col   <- intersect(names(df), c("exam_40","exam"))[1]
   total_col  <- intersect(names(df), c("total_100","total"))[1]
 
+  # Detect component columns and maxima
+  P <- find_component(df, "prac")
+  C <- find_component(df, "ca")
+  E <- find_component(df, "exam")
+
   # Build or coerce Total_100
-  if (is.na(total_col) && all(!is.na(c(prac_col, ca_col, exam_col)))) {
-    df <- df %>% mutate(
-      .prac = to_num(.data[[prac_col]]),
-      .ca   = to_num(.data[[ca_col]]),
-      .exam = to_num(.data[[exam_col]]),
-      Total_100 = .prac + .ca + .exam
-    )
+  if (is.na(total_col) && all(!is.na(c(P$col, C$col, E$col)))) {
+    p <- to_num(df[[P$col]]); c <- to_num(df[[C$col]]); e <- to_num(df[[E$col]])
+    sum_max <- sum(P$max, C$max, E$max, na.rm = TRUE)
+
+    if (!any(is.na(c(P$max, C$max, E$max))) && sum_max != 100) {
+      # Scale to 100 when maxima do not sum to 100
+      df <- df %>%
+        mutate(Total_100 = round((p / P$max + c / C$max + e / E$max) * 100, 0))
+    } else {
+      # Simple sum covers 50/10/40 and 20/20/60 or missing maxima
+      df <- df %>% mutate(Total_100 = p + c + e)
+    }
   } else if (!is.na(total_col)) {
     df <- df %>% mutate(Total_100 = to_num(.data[[total_col]]))
   } else {
     stop("Could not find TOTAL (100) or the PRAC/CA/EXAM columns.")
   }
+
   if (clamp_0_100) df <- df %>% mutate(Total_100 = pmax(0, pmin(100, Total_100)))
 
-  # Enriched output (GradePoint rounded to 2 decimals)
+  # Enriched output
   out <- df %>%
     mutate(
       Name       = if (!is.na(name_col)) .data[[name_col]] else "",
       Matric_No  = if (!is.na(matric_col)) .data[[matric_col]] else NA_character_,
-      GradePoint = round(grade_point(Total_100), 2),  # <<< two decimals
+      GradePoint = round(grade_point(Total_100), 2),  # two decimals
       Grade      = letter_grade(Total_100)
     ) %>%
     relocate(Name, Matric_No, Total_100, GradePoint, Grade) %>%
-    dedupe_source_cols(name_col, matric_col, total_col, prac_col, ca_col, exam_col) %>%
+    dedupe_source_cols(name_col, matric_col, total_col, P$col, C$col, E$col) %>%
     fix_names_excel()
 
-  # Summaries with Percent (0–100 scale in R)
+  # Summaries with Percent
   grade_fine_lv  <- c("A+","A","B+","B","C+","C","D","E","F")
   grade_broad_lv <- c("A","B","C","D","E","F")
   n_all <- nrow(out)
@@ -179,11 +206,10 @@ process_exam_sheet <- function(in_path,
     addWorksheet(wb, "Summary_AtoF")
     addWorksheet(wb, "Plots")
 
-    # Write tables
     writeDataTable(wb, "Grades", out, tableStyle = "TableStyleMedium9")
     setColWidths(wb, "Grades", cols = 1:ncol(out), widths = "auto")
 
-    # Format GradePoint to 2 decimals in Excel
+    # GradePoint 2 decimals in Excel
     gp_col <- which(names(out) == "GradePoint")
     if (length(gp_col)) {
       twoDec <- createStyle(numFmt = "0.00")
@@ -192,7 +218,7 @@ process_exam_sheet <- function(in_path,
                gridExpand = TRUE, stack = TRUE)
     }
 
-    # Convert Percent cols to 0–1 for proper Excel percent formatting
+    # Percent columns to 0–1
     sf_xl <- summary_fine  %>% mutate(Percent = Percent / 100)
     sb_xl <- summary_broad %>% mutate(Percent = Percent / 100)
 
@@ -202,7 +228,6 @@ process_exam_sheet <- function(in_path,
     writeDataTable(wb, "Summary_AtoF", sb_xl, tableStyle = "TableStyleMedium7")
     setColWidths(wb, "Summary_AtoF", cols = 1:ncol(sb_xl), widths = "auto")
 
-    # Style % columns
     pctStyle <- createStyle(numFmt = "0.0%")
     sf_pct_col <- which(names(sf_xl) == "Percent")
     if (length(sf_pct_col)) addStyle(wb, "Summary_Fine", pctStyle,
@@ -213,7 +238,6 @@ process_exam_sheet <- function(in_path,
                                      rows = 2:(nrow(sb_xl) + 1), cols = sb_pct_col,
                                      gridExpand = TRUE, stack = TRUE)
 
-    # Insert plots
     if (save_plots) {
       insertImage(wb, "Plots", paste0(plot_prefix, "_bar_fine.png"),
                   startRow = 1,  startCol = 1, width = 7, height = 4, units = "in")
@@ -236,22 +260,78 @@ process_exam_sheet <- function(in_path,
     plot_hist      = p_hist
   )
 }
-```
 
-### Usage (Load, Run, Export, Summaries, Plots)
-```{r}
 # ----------------------------
-# Usage
+# Batch: many courses to separate folders
 # ----------------------------
-res <- process_exam_sheet(
-  "SWD_scores.xlsx",
-  out_path = "exam_scores_with_grades.xlsx",
-  save_plots = TRUE,
-  write_excel_tables = TRUE
-)
-# View(res$data)
-# View(res$summary_fine); View(res$summary_broad)
-print(res$plot_bar_fine); print(res$plot_bar_broad) #print(res$plot_hist)
+sanitize_course <- function(x) {
+  x <- gsub("[^A-Za-z0-9._-]+", "_", x)
+  sub("^_+|_+$", "", x)
+}
+
+process_many_courses <- function(input_paths,
+                                 out_root = "results",
+                                 sheet = 1,
+                                 save_plots = TRUE,
+                                 write_excel_tables = TRUE) {
+  if (!dir.exists(out_root)) dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
+
+  all_rows <- list()
+
+  for (in_path in input_paths) {
+    course_raw <- file_path_sans_ext(basename(in_path))
+    course     <- sanitize_course(course_raw)
+    out_dir    <- file.path(out_root, course)
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+    out_path    <- file.path(out_dir, paste0(course, "_with_grades.xlsx"))
+    plot_prefix <- file.path(out_dir, course)
+
+    message("Processing ", course)
+    res <- process_exam_sheet(
+      in_path            = in_path,
+      out_path           = out_path,
+      sheet              = sheet,
+      save_plots         = save_plots,
+      plot_prefix        = plot_prefix,
+      write_excel_tables = write_excel_tables
+    )
+
+    sf <- res$summary_fine
+    getc <- function(g) { v <- sf$Count[sf$Grade == g]; if (length(v)) v else 0 }
+    row <- tibble::tibble(
+      Course   = course,
+      Students = nrow(res$data),
+      Aplus = getc("A+"), A = getc("A"),
+      Bplus = getc("B+"), B = getc("B"),
+      Cplus = getc("C+"), C = getc("C"),
+      D = getc("D"), E = getc("E"), F = getc("F"),
+      OutputDir = out_dir,
+      Workbook  = out_path
+    )
+    all_rows[[course]] <- row
+  }
+
+  summary_all <- dplyr::bind_rows(all_rows)
+  readr::write_csv(summary_all, file.path(out_root, "index_summary.csv"))
+  invisible(summary_all)
+}
+
+# ----------------------------
+# Usage examples
+# ----------------------------
+# Single file:
+# res <- process_exam_sheet(
+#   in_path  = "data/STA389_scores.xlsx",
+#   out_path = "results/STA389_scores_with_grades.xlsx",
+#   save_plots = TRUE,
+#   write_excel_tables = TRUE
+# )
+
+# Many courses:
+files <- c("data/STA357_scores.xlsx","data/MTH432_scores.xlsx","data/GNS219_scores.xlsx")
+summary_all <- process_many_courses(files, out_root = "results")
+print(summary_all)
 
 ```
 
